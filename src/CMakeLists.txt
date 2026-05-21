@@ -175,7 +175,9 @@ endif()
 
 if(PACC_SUPPORT)
   message(STATUS "Building with PACC shared-DDR support")
+  find_package(Threads REQUIRED)
   target_sources(nvtop PRIVATE extract_gpuinfo_pacc.c pacc_monitor.c)
+  target_link_libraries(nvtop PRIVATE Threads::Threads)
 endif()
 
 target_include_directories(nvtop PRIVATE

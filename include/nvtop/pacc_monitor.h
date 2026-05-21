@@ -96,6 +96,14 @@ struct pacc_monitor_sample {
   struct pacc_monitor_job_counter jobs[pacc_monitor_job_count];
 };
 
+struct pacc_monitor_process_sample {
+  pid_t pid;
+  uint32_t gpu_util_percent;
+  uint64_t gpu_active_ns;
+  uint64_t sample_window_ns;
+  uint64_t gpu_memory_usage;
+};
+
 struct pacc_monitor_backend;
 
 const char *pacc_monitor_job_name(uint32_t job_id);
@@ -115,5 +123,8 @@ int pacc_monitor_write_control(struct pacc_monitor_backend *backend, unsigned in
                                size_t len);
 int pacc_monitor_scan_processes(const struct pacc_monitor_backend *backend, unsigned index, pid_t *pids,
                                 size_t max_pids, size_t *count);
+int pacc_monitor_sample_processes(struct pacc_monitor_backend *backend, unsigned index,
+                                  struct pacc_monitor_process_sample *processes, size_t max_processes,
+                                  size_t *count);
 
 #endif // NVTOP_PACC_MONITOR_H__

@@ -151,19 +151,19 @@ static void gpuinfo_pacc_refresh_dynamic_info(struct gpu_info *_gpu_info) {
 
 static void gpuinfo_pacc_get_running_processes(struct gpu_info *_gpu_info) {
   struct gpu_info_pacc *pacc_info = container_of(_gpu_info, struct gpu_info_pacc, base);
-  pid_t pids[PACC_MONITOR_MAX_PIDS];
-  size_t pid_count = 0;
+  struct pacc_monitor_process_sample samples[PACC_MONITOR_MAX_PIDS];
+  size_t process_count = 0;
 
   _gpu_info->processes_count = 0;
   if (!pacc_backend ||
-      pacc_monitor_scan_processes(pacc_backend, pacc_info->monitor_index, pids,
-                                  sizeof(pids) / sizeof(pids[0]), &pid_count) != 0 ||
-      pid_count == 0) {
+      pacc_monitor_sample_processes(pacc_backend, pacc_info->monitor_index, samples,
+                                    sizeof(samples) / sizeof(samples[0]), &process_count) != 0 ||
+      process_count == 0) {
     return;
   }
 
-  if (_gpu_info->processes_array_size < pid_count) {
-    struct gpu_process *new_processes = realloc(_gpu_info->processes, pid_count * sizeof(*_gpu_info->processes));
+  if (_gpu_info->processes_array_size < process_count) {
+    struct gpu_process *new_processes = realloc(_gpu_info->processes, process_count * sizeof(*_gpu_info->processes));
     if (!new_processes) {
       _gpu_info->processes_array_size = 0;
       free(_gpu_info->processes);
@@ -171,16 +171,15 @@ static void gpuinfo_pacc_get_running_processes(struct gpu_info *_gpu_info) {
       return;
     }
     _gpu_info->processes = new_processes;
-    _gpu_info->processes_array_size = pid_count;
+    _gpu_info->processes_array_size = process_count;
   }
 
-  _gpu_info->processes_count = (unsigned)pid_count;
-  for (size_t i = 0; i < pid_count; i++) {
+  _gpu_info->processes_count = (unsigned)process_count;
+  for (size_t i = 0; i < process_count; i++) {
     memset(&_gpu_info->processes[i], 0, sizeof(_gpu_info->processes[i]));
     _gpu_info->processes[i].type = gpu_process_compute;
-    _gpu_info->processes[i].pid = pids[i];
-    if (pid_count == 1 && pacc_info->last_sample.gpu_util_percent > 0) {
-      SET_GPUINFO_PROCESS(&_gpu_info->processes[i], gpu_usage, pacc_info->last_sample.gpu_util_percent);
-    }
+    _gpu_info->processes[i].pid = samples[i].pid;
+    SET_GPUINFO_PROCESS(&_gpu_info->processes[i], gpu_usage, samples[i].gpu_util_percent);
+    SET_GPUINFO_PROCESS(&_gpu_info->processes[i], gpu_memory_usage, samples[i].gpu_memory_usage);
   }
 }

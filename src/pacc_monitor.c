@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,6 +50,8 @@
 #define HETGPU_PACC_DIAG_RING_RECORDS 192U
 #define HETGPU_PACC_DIAG_MAGIC UINT64_C(0x4847505544494147)
 #define HETGPU_PACC_DEFAULT_SHARED_DDR_BYTES UINT64_C(0x100000000)
+#define PACC_MONITOR_DEFAULT_SAMPLE_US UINT64_C(20000)
+#define PACC_MONITOR_MAX_TRACKED_PROCESSES 256U
 
 #define PACC_IOC_MAGIC 'p'
 #define PACC_IOC_ZLUDA_GET_DDR_BASE _IOR(PACC_IOC_MAGIC, 6, struct pacc_zluda_ddr_info)
@@ -122,6 +125,13 @@ struct pacc_monitor_runtime_table_prefix {
   uint32_t reserved0;
 };
 
+struct pacc_monitor_process_accum {
+  pid_t pid;
+  uint64_t active_ns;
+  uint64_t last_seen_ns;
+  uint64_t gpu_memory_usage;
+};
+
 struct pacc_monitor_device {
   int fd;
   uint32_t pacc_id;
@@ -144,6 +154,17 @@ struct pacc_monitor_device {
   uint64_t job_submit_count;
   uint64_t job_complete_count;
   struct pacc_monitor_job_counter jobs[pacc_monitor_job_count];
+
+  bool sampler_have_last;
+  uint64_t sampler_last_ns;
+  uint64_t sampler_last_submitted_seq;
+  uint64_t sampler_last_completed_seq;
+  uint64_t sampler_last_beacon_seq;
+  uint64_t sample_window_elapsed_ns;
+  uint64_t sample_window_active_ns;
+  uint64_t process_window_elapsed_ns;
+  size_t process_count;
+  struct pacc_monitor_process_accum processes[PACC_MONITOR_MAX_TRACKED_PROCESSES];
 };
 
 struct pacc_monitor_backend {
@@ -151,7 +172,21 @@ struct pacc_monitor_backend {
   uint32_t busy_window_ms;
   unsigned count;
   struct pacc_monitor_device devices[PACC_MONITOR_MAX_DEVICES];
+  pthread_mutex_t lock;
+  bool lock_initialized;
+  pthread_t sampler_thread;
+  bool sampler_running;
+  bool stop_sampler;
+  uint64_t sample_interval_us;
 };
+
+static uint64_t read_diag_count(struct pacc_monitor_device *dev);
+static int scan_processes_for_device(const struct pacc_monitor_backend *backend, const struct pacc_monitor_device *dev,
+                                     pid_t *pids, size_t max_pids, size_t *count);
+static void read_device_snapshot(struct pacc_monitor_device *dev, struct pacc_monitor_sample *sample,
+                                 bool include_diag);
+static void start_sampler(struct pacc_monitor_backend *backend);
+static void stop_sampler(struct pacc_monitor_backend *backend);
 
 static uint64_t monotonic_ns(void) {
   struct timespec ts;
@@ -159,6 +194,14 @@ static uint64_t monotonic_ns(void) {
     return 0;
   }
   return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
+}
+
+static void sleep_us(uint64_t usec) {
+  struct timespec ts;
+  ts.tv_sec = (time_t)(usec / UINT64_C(1000000));
+  ts.tv_nsec = (long)((usec % UINT64_C(1000000)) * UINT64_C(1000));
+  while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+  }
 }
 
 static bool parse_u64_checked(const char *s, uint64_t *out) {
@@ -644,6 +687,9 @@ int pacc_monitor_open(struct pacc_monitor_backend **backend, const struct pacc_m
   for (unsigned i = 0; i < PACC_MONITOR_MAX_DEVICES; i++) {
     created->devices[i].fd = -1;
   }
+  if (pthread_mutex_init(&created->lock, NULL) == 0) {
+    created->lock_initialized = true;
+  }
 
   created->client = options ? options->client : pacc_monitor_client_nvtop;
   created->busy_window_ms = options && options->busy_window_ms ? options->busy_window_ms : 1000U;
@@ -659,10 +705,14 @@ int pacc_monitor_open(struct pacc_monitor_backend **backend, const struct pacc_m
   }
 
   if (created->count == 0) {
+    if (created->lock_initialized) {
+      pthread_mutex_destroy(&created->lock);
+    }
     free(created);
     return -ENODEV;
   }
 
+  start_sampler(created);
   *backend = created;
   return 0;
 }
@@ -671,8 +721,12 @@ void pacc_monitor_close(struct pacc_monitor_backend *backend) {
   if (!backend) {
     return;
   }
+  stop_sampler(backend);
   for (unsigned i = 0; i < backend->count; i++) {
     close_device(&backend->devices[i]);
+  }
+  if (backend->lock_initialized) {
+    pthread_mutex_destroy(&backend->lock);
   }
   free(backend);
 }
@@ -710,6 +764,199 @@ static void update_submit(struct pacc_monitor_sample *sample, uint32_t job_id, u
     sample->submitted_seq = seq;
     sample->submitted_job_id = job_id;
   }
+}
+
+static void read_device_snapshot(struct pacc_monitor_device *dev, struct pacc_monitor_sample *sample,
+                                 bool include_diag) {
+  struct pacc_monitor_doorbell doorbell;
+  struct pacc_monitor_job_desc kernel_desc;
+  struct pacc_monitor_host_status completion;
+  struct pacc_monitor_jobd_beacon beacon;
+  struct pacc_monitor_runtime_table_prefix runtime;
+  uint64_t memory_total;
+
+  memset(sample, 0, sizeof(*sample));
+  sample->abi_version = PACC_MONITOR_ABI_VERSION;
+  sample->pacc_id = dev->pacc_id;
+  sample->timestamp_ns = monotonic_ns();
+  sample->online = dev->fd >= 0;
+
+  memset(&doorbell, 0, sizeof(doorbell));
+  if (read_control(dev, 0, &doorbell, sizeof(doorbell)) && doorbell.magic == HETGPU_PACC_JOB_MAGIC &&
+      doorbell.version == HETGPU_PACC_JOB_VERSION) {
+    update_submit(sample, doorbell.job_id, doorbell.seq);
+  }
+
+  memset(&kernel_desc, 0, sizeof(kernel_desc));
+  if (read_control(dev, 0, &kernel_desc, sizeof(kernel_desc)) && kernel_desc.buf_info == PACC_JOB_MAGIC) {
+    update_submit(sample, pacc_monitor_job_kernel, kernel_desc.seq);
+  }
+
+  for (uint32_t slot = 0; slot < HETGPU_PACC_MAX_JOB_ID; slot++) {
+    struct pacc_monitor_arg_slot_header header;
+    uint64_t off = HETGPU_PACC_ARG_BASE_OFF + (uint64_t)slot * HETGPU_PACC_ARG_SLOT_BYTES;
+    memset(&header, 0, sizeof(header));
+    if (off + sizeof(header) <= HETGPU_PACC_CONTROL_BYTES &&
+        read_control(dev, off, &header, sizeof(header)) && header.magic == HETGPU_PACC_JOB_MAGIC &&
+        header.version == HETGPU_PACC_JOB_VERSION) {
+      update_submit(sample, header.job_id, header.seq);
+    }
+  }
+
+  memset(&runtime, 0, sizeof(runtime));
+  if (read_control(dev, HETGPU_PACC_RUNTIME_TABLE_OFF, &runtime, sizeof(runtime)) &&
+      runtime.magic == HETGPU_PACC_RUNTIME_TABLE_MAGIC && runtime.version == HETGPU_PACC_RUNTIME_TABLE_VERSION) {
+    sample->runtime_seq = runtime.seq;
+  }
+
+  memset(&completion, 0, sizeof(completion));
+  if (read_control(dev, HETGPU_PACC_COMPLETION_OFF, &completion, sizeof(completion)) &&
+      completion.magic == HETGPU_PACC_JOB_MAGIC && completion.version == HETGPU_PACC_JOB_VERSION) {
+    sample->completed_job_id = completion.job_id;
+    sample->completion_status = completion.status;
+    sample->completed_seq = completion.seq;
+  }
+
+  memset(&beacon, 0, sizeof(beacon));
+  if (read_control(dev, HETGPU_PACC_BEACON_OFF, &beacon, sizeof(beacon)) &&
+      beacon.magic == HETGPU_PACC_BEACON_MAGIC && beacon.version == HETGPU_PACC_JOB_VERSION) {
+    sample->beacon_phase = beacon.phase;
+    sample->beacon_detail = beacon.detail;
+    sample->beacon_seq = beacon.seq;
+  }
+
+  sample->diag_count = include_diag ? read_diag_count(dev) : dev->last_diag_count;
+  sample->active = sample->submitted_seq != 0 && sample->submitted_seq != sample->completed_seq;
+  sample->active_job_id = sample->active ? sample->submitted_job_id : sample->completed_job_id;
+
+  memory_total = dev->shared_ddr_size > HETGPU_PACC_SHARED_DDR_USER_OFF
+                     ? dev->shared_ddr_size - HETGPU_PACC_SHARED_DDR_USER_OFF
+                     : dev->shared_ddr_size;
+  sample->total_memory = memory_total;
+  sample->used_memory = 0;
+  sample->free_memory = memory_total;
+  sample->mem_util_percent = 0;
+}
+
+static struct pacc_monitor_process_accum *get_process_accum(struct pacc_monitor_device *dev, pid_t pid,
+                                                            uint64_t now_ns) {
+  size_t oldest = 0;
+
+  for (size_t i = 0; i < dev->process_count; i++) {
+    if (dev->processes[i].pid == pid) {
+      return &dev->processes[i];
+    }
+    if (dev->processes[i].last_seen_ns < dev->processes[oldest].last_seen_ns) {
+      oldest = i;
+    }
+  }
+
+  if (dev->process_count < PACC_MONITOR_MAX_TRACKED_PROCESSES) {
+    struct pacc_monitor_process_accum *entry = &dev->processes[dev->process_count++];
+    memset(entry, 0, sizeof(*entry));
+    entry->pid = pid;
+    entry->last_seen_ns = now_ns;
+    return entry;
+  }
+
+  memset(&dev->processes[oldest], 0, sizeof(dev->processes[oldest]));
+  dev->processes[oldest].pid = pid;
+  dev->processes[oldest].last_seen_ns = now_ns;
+  return &dev->processes[oldest];
+}
+
+static void attribute_active_time(struct pacc_monitor_device *dev, const pid_t *pids, size_t pid_count,
+                                  uint64_t active_ns, uint64_t now_ns) {
+  if (!dev || !pids || pid_count == 0 || active_ns == 0) {
+    return;
+  }
+
+  uint64_t share_ns = active_ns / pid_count;
+  uint64_t remainder_ns = active_ns % pid_count;
+  for (size_t i = 0; i < pid_count; i++) {
+    struct pacc_monitor_process_accum *entry = get_process_accum(dev, pids[i], now_ns);
+    entry->active_ns += share_ns + (i == 0 ? remainder_ns : 0);
+    entry->last_seen_ns = now_ns;
+  }
+}
+
+static void *sampler_main(void *opaque) {
+  struct pacc_monitor_backend *backend = opaque;
+
+  while (!backend->stop_sampler) {
+    uint64_t now_ns = monotonic_ns();
+
+    for (unsigned i = 0; i < backend->count; i++) {
+      struct pacc_monitor_sample sample;
+      pid_t pids[PACC_MONITOR_MAX_PIDS];
+      size_t pid_count = 0;
+      struct pacc_monitor_device *dev = &backend->devices[i];
+      bool active_or_changed;
+
+      read_device_snapshot(dev, &sample, false);
+      active_or_changed =
+          sample.active ||
+          (dev->sampler_have_last &&
+           (sample.submitted_seq != dev->sampler_last_submitted_seq ||
+            sample.completed_seq != dev->sampler_last_completed_seq ||
+            sample.beacon_seq != dev->sampler_last_beacon_seq));
+      if (active_or_changed) {
+        (void)scan_processes_for_device(backend, dev, pids, sizeof(pids) / sizeof(pids[0]), &pid_count);
+      }
+
+      pthread_mutex_lock(&backend->lock);
+      if (dev->sampler_have_last && now_ns > dev->sampler_last_ns) {
+        uint64_t elapsed_ns = now_ns - dev->sampler_last_ns;
+        if (elapsed_ns <= backend->sample_interval_us * UINT64_C(1000) * 10) {
+          dev->sample_window_elapsed_ns += elapsed_ns;
+          dev->process_window_elapsed_ns += elapsed_ns;
+          if (active_or_changed) {
+            dev->sample_window_active_ns += elapsed_ns;
+            attribute_active_time(dev, pids, pid_count, elapsed_ns, now_ns);
+          }
+        }
+      }
+      dev->sampler_last_ns = now_ns;
+      dev->sampler_last_submitted_seq = sample.submitted_seq;
+      dev->sampler_last_completed_seq = sample.completed_seq;
+      dev->sampler_last_beacon_seq = sample.beacon_seq;
+      dev->sampler_have_last = true;
+      pthread_mutex_unlock(&backend->lock);
+    }
+
+    sleep_us(backend->sample_interval_us);
+  }
+
+  return NULL;
+}
+
+static void start_sampler(struct pacc_monitor_backend *backend) {
+  uint64_t interval_us;
+
+  if (!backend || !backend->lock_initialized || backend->sampler_running) {
+    return;
+  }
+
+  interval_us = env_u64_default("PACC_MONITOR_SAMPLE_US", PACC_MONITOR_DEFAULT_SAMPLE_US);
+  if (interval_us < 1000) {
+    interval_us = 1000;
+  } else if (interval_us > 1000000) {
+    interval_us = 1000000;
+  }
+  backend->sample_interval_us = interval_us;
+  backend->stop_sampler = false;
+  if (pthread_create(&backend->sampler_thread, NULL, sampler_main, backend) == 0) {
+    backend->sampler_running = true;
+  }
+}
+
+static void stop_sampler(struct pacc_monitor_backend *backend) {
+  if (!backend || !backend->sampler_running) {
+    return;
+  }
+  backend->stop_sampler = true;
+  pthread_join(backend->sampler_thread, NULL);
+  backend->sampler_running = false;
 }
 
 static void update_job_counters(struct pacc_monitor_device *dev, struct pacc_monitor_sample *sample, bool activity) {
@@ -772,101 +1019,52 @@ static uint64_t read_diag_count(struct pacc_monitor_device *dev) {
 int pacc_monitor_sample_device(struct pacc_monitor_backend *backend, unsigned index,
                                struct pacc_monitor_sample *sample) {
   struct pacc_monitor_device *dev;
-  struct pacc_monitor_doorbell doorbell;
-  struct pacc_monitor_job_desc kernel_desc;
-  struct pacc_monitor_host_status completion;
-  struct pacc_monitor_jobd_beacon beacon;
-  struct pacc_monitor_runtime_table_prefix runtime;
   bool activity = false;
-  uint64_t memory_total;
+  uint64_t active_ns = 0;
+  uint64_t elapsed_ns = 0;
 
   if (!backend || !sample || index >= backend->count) {
     return -EINVAL;
   }
 
   dev = &backend->devices[index];
-  memset(sample, 0, sizeof(*sample));
-  sample->abi_version = PACC_MONITOR_ABI_VERSION;
-  sample->pacc_id = dev->pacc_id;
-  sample->timestamp_ns = monotonic_ns();
-  sample->online = dev->fd >= 0;
-
-  memset(&doorbell, 0, sizeof(doorbell));
-  if (read_control(dev, 0, &doorbell, sizeof(doorbell)) && doorbell.magic == HETGPU_PACC_JOB_MAGIC &&
-      doorbell.version == HETGPU_PACC_JOB_VERSION) {
-    update_submit(sample, doorbell.job_id, doorbell.seq);
-  }
-
-  memset(&kernel_desc, 0, sizeof(kernel_desc));
-  if (read_control(dev, 0, &kernel_desc, sizeof(kernel_desc)) && kernel_desc.buf_info == PACC_JOB_MAGIC) {
-    update_submit(sample, pacc_monitor_job_kernel, kernel_desc.seq);
-  }
-
-  for (uint32_t slot = 0; slot < HETGPU_PACC_MAX_JOB_ID; slot++) {
-    struct pacc_monitor_arg_slot_header header;
-    uint64_t off = HETGPU_PACC_ARG_BASE_OFF + (uint64_t)slot * HETGPU_PACC_ARG_SLOT_BYTES;
-    memset(&header, 0, sizeof(header));
-    if (off + sizeof(header) <= HETGPU_PACC_CONTROL_BYTES &&
-        read_control(dev, off, &header, sizeof(header)) && header.magic == HETGPU_PACC_JOB_MAGIC &&
-        header.version == HETGPU_PACC_JOB_VERSION) {
-      update_submit(sample, header.job_id, header.seq);
-    }
-  }
-
-  memset(&runtime, 0, sizeof(runtime));
-  if (read_control(dev, HETGPU_PACC_RUNTIME_TABLE_OFF, &runtime, sizeof(runtime)) &&
-      runtime.magic == HETGPU_PACC_RUNTIME_TABLE_MAGIC && runtime.version == HETGPU_PACC_RUNTIME_TABLE_VERSION) {
-    sample->runtime_seq = runtime.seq;
-  }
-
-  memset(&completion, 0, sizeof(completion));
-  if (read_control(dev, HETGPU_PACC_COMPLETION_OFF, &completion, sizeof(completion)) &&
-      completion.magic == HETGPU_PACC_JOB_MAGIC && completion.version == HETGPU_PACC_JOB_VERSION) {
-    sample->completed_job_id = completion.job_id;
-    sample->completion_status = completion.status;
-    sample->completed_seq = completion.seq;
-  }
-
-  memset(&beacon, 0, sizeof(beacon));
-  if (read_control(dev, HETGPU_PACC_BEACON_OFF, &beacon, sizeof(beacon)) &&
-      beacon.magic == HETGPU_PACC_BEACON_MAGIC && beacon.version == HETGPU_PACC_JOB_VERSION) {
-    sample->beacon_phase = beacon.phase;
-    sample->beacon_detail = beacon.detail;
-    sample->beacon_seq = beacon.seq;
-  }
-
-  sample->diag_count = read_diag_count(dev);
-
-  sample->active = sample->submitted_seq != 0 && sample->submitted_seq != sample->completed_seq;
-  sample->active_job_id = sample->active ? sample->submitted_job_id : sample->completed_job_id;
+  read_device_snapshot(dev, sample, true);
 
   activity = sample->active ||
              (dev->have_last && (sample->submitted_seq != dev->last_submitted_seq ||
                                  sample->completed_seq != dev->last_completed_seq ||
                                  sample->beacon_seq != dev->last_beacon_seq ||
                                  sample->diag_count != dev->last_diag_count));
-  update_job_counters(dev, sample, activity);
 
-  memory_total = dev->shared_ddr_size > HETGPU_PACC_SHARED_DDR_USER_OFF
-                     ? dev->shared_ddr_size - HETGPU_PACC_SHARED_DDR_USER_OFF
-                     : dev->shared_ddr_size;
-  sample->total_memory = memory_total;
-  sample->used_memory = 0;
-  sample->free_memory = memory_total;
-  sample->mem_util_percent = 0;
-
-  if (activity || sample->active ||
-      (dev->last_activity_ns && sample->timestamp_ns >= dev->last_activity_ns &&
-       sample->timestamp_ns - dev->last_activity_ns <= (uint64_t)backend->busy_window_ms * UINT64_C(1000000))) {
-    sample->gpu_util_percent = 100;
-  } else {
-    sample->gpu_util_percent = 0;
+  if (backend->lock_initialized) {
+    pthread_mutex_lock(&backend->lock);
   }
-
+  update_job_counters(dev, sample, activity);
+  if (backend->sampler_running) {
+    active_ns = dev->sample_window_active_ns;
+    elapsed_ns = dev->sample_window_elapsed_ns;
+    dev->sample_window_active_ns = 0;
+    dev->sample_window_elapsed_ns = 0;
+  }
   sample->job_submit_count = dev->job_submit_count;
   sample->job_complete_count = dev->job_complete_count;
   memcpy(sample->jobs, dev->jobs, sizeof(sample->jobs));
   dev->have_last = true;
+  if (backend->lock_initialized) {
+    pthread_mutex_unlock(&backend->lock);
+  }
+
+  if (elapsed_ns > 0) {
+    uint64_t util = (active_ns * UINT64_C(100) + elapsed_ns / 2) / elapsed_ns;
+    sample->gpu_util_percent = util > 100 ? 100 : (uint32_t)util;
+  } else if (activity || sample->active ||
+             (dev->last_activity_ns && sample->timestamp_ns >= dev->last_activity_ns &&
+              sample->timestamp_ns - dev->last_activity_ns <= (uint64_t)backend->busy_window_ms * UINT64_C(1000000))) {
+    sample->gpu_util_percent = backend->sampler_running ? 0 : 100;
+  } else {
+    sample->gpu_util_percent = 0;
+  }
+
   return 0;
 }
 
@@ -907,6 +1105,36 @@ static bool pid_already_seen(pid_t pid, const pid_t *pids, size_t count) {
   return false;
 }
 
+static bool pid_comm_equals(pid_t pid, const char *comm) {
+  char path[64];
+  char buf[64];
+  int fd;
+  ssize_t n;
+
+  if (pid <= 0 || !comm) {
+    return false;
+  }
+
+  snprintf(path, sizeof(path), "/proc/%ld/comm", (long)pid);
+  fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return false;
+  }
+  n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0) {
+    return false;
+  }
+  buf[n] = '\0';
+  for (ssize_t i = 0; i < n; i++) {
+    if (buf[i] == '\n' || buf[i] == '\r') {
+      buf[i] = '\0';
+      break;
+    }
+  }
+  return !strcmp(buf, comm);
+}
+
 static bool fd_target_matches_pacc(const char *target, const struct pacc_monitor_device *dev) {
   char needle[64];
 
@@ -929,15 +1157,14 @@ static bool fd_target_matches_pacc(const char *target, const struct pacc_monitor
   return !strcmp(target, needle);
 }
 
-int pacc_monitor_scan_processes(const struct pacc_monitor_backend *backend, unsigned index, pid_t *pids,
-                                size_t max_pids, size_t *count) {
-  const struct pacc_monitor_device *dev;
+static int scan_processes_for_device(const struct pacc_monitor_backend *backend, const struct pacc_monitor_device *dev,
+                                     pid_t *pids, size_t max_pids, size_t *count) {
   DIR *proc_dir;
   struct dirent *proc_entry;
   size_t found = 0;
   pid_t self_pid = getpid();
 
-  if (!backend || index >= backend->count || !pids || !count) {
+  if (!backend || !dev || !pids || !count) {
     return -EINVAL;
   }
   *count = 0;
@@ -945,7 +1172,6 @@ int pacc_monitor_scan_processes(const struct pacc_monitor_backend *backend, unsi
     return 0;
   }
 
-  dev = &backend->devices[index];
   proc_dir = opendir("/proc");
   if (!proc_dir) {
     return -errno;
@@ -961,8 +1187,11 @@ int pacc_monitor_scan_processes(const struct pacc_monitor_backend *backend, unsi
       continue;
     }
     pid = (pid_t)strtol(proc_entry->d_name, NULL, 10);
-    if (pid <= 0 || (backend->client == pacc_monitor_client_nvtop && pid == self_pid) ||
-        pid_already_seen(pid, pids, found)) {
+    if (pid <= 0 || pid_already_seen(pid, pids, found)) {
+      continue;
+    }
+    if (backend->client == pacc_monitor_client_nvtop &&
+        (pid == self_pid || pid_comm_equals(pid, "nvtop"))) {
       continue;
     }
 
@@ -994,5 +1223,102 @@ int pacc_monitor_scan_processes(const struct pacc_monitor_backend *backend, unsi
 
   closedir(proc_dir);
   *count = found;
+  return 0;
+}
+
+int pacc_monitor_scan_processes(const struct pacc_monitor_backend *backend, unsigned index, pid_t *pids,
+                                size_t max_pids, size_t *count) {
+  if (!backend || index >= backend->count) {
+    return -EINVAL;
+  }
+  return scan_processes_for_device(backend, &backend->devices[index], pids, max_pids, count);
+}
+
+static bool pid_in_list(pid_t pid, const pid_t *pids, size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    if (pids[i] == pid) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool process_sample_already_added(pid_t pid, const struct pacc_monitor_process_sample *processes,
+                                         size_t count) {
+  for (size_t i = 0; i < count; i++) {
+    if (processes[i].pid == pid) {
+      return true;
+    }
+  }
+  return false;
+}
+
+int pacc_monitor_sample_processes(struct pacc_monitor_backend *backend, unsigned index,
+                                  struct pacc_monitor_process_sample *processes, size_t max_processes,
+                                  size_t *count) {
+  struct pacc_monitor_device *dev;
+  pid_t current_pids[PACC_MONITOR_MAX_PIDS];
+  size_t current_count = 0;
+  size_t out_count = 0;
+  uint64_t window_ns = 0;
+
+  if (!backend || index >= backend->count || !processes || !count) {
+    return -EINVAL;
+  }
+
+  *count = 0;
+  if (max_processes == 0) {
+    return 0;
+  }
+
+  dev = &backend->devices[index];
+  (void)scan_processes_for_device(backend, dev, current_pids, sizeof(current_pids) / sizeof(current_pids[0]),
+                                  &current_count);
+
+  if (backend->lock_initialized) {
+    pthread_mutex_lock(&backend->lock);
+  }
+
+  window_ns = dev->process_window_elapsed_ns;
+  for (size_t i = 0; i < dev->process_count && out_count < max_processes; i++) {
+    struct pacc_monitor_process_accum *entry = &dev->processes[i];
+    bool current = pid_in_list(entry->pid, current_pids, current_count);
+    if (entry->active_ns == 0 && !current) {
+      continue;
+    }
+
+    processes[out_count].pid = entry->pid;
+    processes[out_count].gpu_active_ns = entry->active_ns;
+    processes[out_count].sample_window_ns = window_ns;
+    processes[out_count].gpu_memory_usage = entry->gpu_memory_usage;
+    if (window_ns > 0) {
+      uint64_t util = (entry->active_ns * UINT64_C(100) + window_ns / 2) / window_ns;
+      processes[out_count].gpu_util_percent = util > 100 ? 100 : (uint32_t)util;
+    } else {
+      processes[out_count].gpu_util_percent = 0;
+    }
+    out_count++;
+  }
+
+  for (size_t i = 0; i < current_count && out_count < max_processes; i++) {
+    if (process_sample_already_added(current_pids[i], processes, out_count)) {
+      continue;
+    }
+    memset(&processes[out_count], 0, sizeof(processes[out_count]));
+    processes[out_count].pid = current_pids[i];
+    processes[out_count].sample_window_ns = window_ns;
+    out_count++;
+  }
+
+  for (size_t i = 0; i < dev->process_count; i++) {
+    dev->processes[i].active_ns = 0;
+  }
+  dev->process_window_elapsed_ns = 0;
+
+  if (backend->lock_initialized) {
+    pthread_mutex_unlock(&backend->lock);
+  }
+
+  *count = out_count;
   return 0;
 }
