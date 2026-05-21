@@ -173,6 +173,11 @@ if(IXML_SUPPORT)
   target_sources(nvtop PRIVATE extract_gpuinfo_ixml.c)
 endif()
 
+if(PACC_SUPPORT)
+  message(STATUS "Building with PACC shared-DDR support")
+  target_sources(nvtop PRIVATE extract_gpuinfo_pacc.c pacc_monitor.c)
+endif()
+
 target_include_directories(nvtop PRIVATE
   ${PROJECT_SOURCE_DIR}/include
   ${PROJECT_BINARY_DIR}/include)
