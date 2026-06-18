@@ -147,6 +147,10 @@ static void gpuinfo_pacc_refresh_dynamic_info(struct gpu_info *_gpu_info) {
     SET_GPUINFO_DYNAMIC(dynamic_info, used_memory, sample.used_memory);
     SET_GPUINFO_DYNAMIC(dynamic_info, free_memory, sample.free_memory);
   }
+  if (sample.memory_bandwidth_valid) {
+    SET_GPUINFO_DYNAMIC(dynamic_info, pcie_rx, sample.memory_read_kb_s);
+    SET_GPUINFO_DYNAMIC(dynamic_info, pcie_tx, sample.memory_write_kb_s);
+  }
 }
 
 static void gpuinfo_pacc_get_running_processes(struct gpu_info *_gpu_info) {

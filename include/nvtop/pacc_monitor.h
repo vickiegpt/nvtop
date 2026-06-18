@@ -78,6 +78,12 @@ struct pacc_monitor_sample {
   uint64_t used_memory;
   uint64_t free_memory;
 
+  bool memory_bandwidth_valid;
+  uint64_t memory_read_bytes;
+  uint64_t memory_write_bytes;
+  uint32_t memory_read_kb_s;
+  uint32_t memory_write_kb_s;
+
   uint32_t active_job_id;
   uint32_t submitted_job_id;
   uint64_t submitted_seq;

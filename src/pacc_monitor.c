@@ -52,6 +52,7 @@
 #define HETGPU_PACC_DEFAULT_SHARED_DDR_BYTES UINT64_C(0x100000000)
 #define PACC_MONITOR_DEFAULT_SAMPLE_US UINT64_C(20000)
 #define PACC_MONITOR_MAX_TRACKED_PROCESSES 256U
+#define PACC_MONITOR_ALLOC_STATS_DEFAULT_DIR "/tmp/hetgpu_pacc_allocs"
 
 #define PACC_IOC_MAGIC 'p'
 #define PACC_IOC_ZLUDA_GET_DDR_BASE _IOR(PACC_IOC_MAGIC, 6, struct pacc_zluda_ddr_info)
@@ -132,6 +133,14 @@ struct pacc_monitor_process_accum {
   uint64_t gpu_memory_usage;
 };
 
+struct pacc_monitor_pid_stats {
+  bool have_memory_usage;
+  bool have_memory_bandwidth;
+  uint64_t gpu_memory_usage;
+  uint64_t memory_read_bytes;
+  uint64_t memory_write_bytes;
+};
+
 struct pacc_monitor_device {
   int fd;
   uint32_t pacc_id;
@@ -163,6 +172,10 @@ struct pacc_monitor_device {
   uint64_t sample_window_elapsed_ns;
   uint64_t sample_window_active_ns;
   uint64_t process_window_elapsed_ns;
+  bool have_memory_bandwidth_last;
+  uint64_t last_memory_bandwidth_ns;
+  uint64_t last_memory_read_bytes;
+  uint64_t last_memory_write_bytes;
   size_t process_count;
   struct pacc_monitor_process_accum processes[PACC_MONITOR_MAX_TRACKED_PROCESSES];
 };
@@ -232,12 +245,11 @@ static uint64_t env_u64_default(const char *name, uint64_t fallback) {
   return parse_u64_checked(getenv(name), &value) ? value : fallback;
 }
 
-static bool read_u64_file(const char *path, uint64_t *out) {
-  char buf[64];
+static bool read_file_to_buffer(const char *path, char *buf, size_t buf_size) {
   int fd;
   ssize_t n;
 
-  if (!path || !out) {
+  if (!path || !buf || buf_size == 0) {
     return false;
   }
 
@@ -245,13 +257,249 @@ static bool read_u64_file(const char *path, uint64_t *out) {
   if (fd < 0) {
     return false;
   }
-  n = read(fd, buf, sizeof(buf) - 1);
+  n = read(fd, buf, buf_size - 1);
   close(fd);
   if (n <= 0) {
     return false;
   }
   buf[n] = '\0';
+  return true;
+}
+
+static bool read_u64_file(const char *path, uint64_t *out) {
+  char buf[64];
+
+  if (!read_file_to_buffer(path, buf, sizeof(buf))) {
+    return false;
+  }
   return parse_u64_checked(buf, out);
+}
+
+static bool parse_key_value_u64(const char *buf, const char *key, uint64_t *out) {
+  size_t key_len;
+  const char *line;
+
+  if (!buf || !key || !out) {
+    return false;
+  }
+
+  key_len = strlen(key);
+  line = buf;
+  while (*line) {
+    const char *line_end = strchr(line, '\n');
+    size_t line_len = line_end ? (size_t)(line_end - line) : strlen(line);
+    if (line_len > key_len && !strncmp(line, key, key_len) && line[key_len] == '=') {
+      char value[64];
+      size_t value_len = line_len - key_len - 1;
+      if (value_len >= sizeof(value)) {
+        return false;
+      }
+      memcpy(value, line + key_len + 1, value_len);
+      value[value_len] = '\0';
+      return parse_u64_checked(value, out);
+    }
+    if (!line_end) {
+      break;
+    }
+    line = line_end + 1;
+  }
+  return false;
+}
+
+static void stats_saturating_add(uint64_t *total, uint64_t value) {
+  if (!total) {
+    return;
+  }
+  if (UINT64_MAX - *total < value) {
+    *total = UINT64_MAX;
+    return;
+  }
+  *total += value;
+}
+
+static bool read_pid_alloc_stats(pid_t pid, struct pacc_monitor_pid_stats *stats) {
+  char path[PATH_MAX];
+  char bw_path[PATH_MAX];
+  char buf[1024];
+  const char *dir;
+  int len;
+  uint64_t value;
+  uint64_t shared_ddr = 0;
+  uint64_t shared_ddr_ipc = 0;
+  uint64_t driver = 0;
+  bool have_device_memory_key = false;
+  bool have_any = false;
+
+  if (pid <= 0 || !stats) {
+    return false;
+  }
+
+  memset(stats, 0, sizeof(*stats));
+  dir = getenv("HETGPU_PACC_ALLOC_STATS_DIR");
+  if (!dir || !*dir) {
+    dir = PACC_MONITOR_ALLOC_STATS_DEFAULT_DIR;
+  }
+  len = snprintf(path, sizeof(path), "%s/%ld", dir, (long)pid);
+  if (len < 0 || (size_t)len >= sizeof(path)) {
+    return false;
+  }
+
+  if (read_file_to_buffer(path, buf, sizeof(buf))) {
+    have_any = true;
+    if (parse_key_value_u64(buf, "device_memory", &value)) {
+      stats->gpu_memory_usage = value;
+      stats->have_memory_usage = true;
+    } else {
+      have_device_memory_key = parse_key_value_u64(buf, "shared_ddr", &shared_ddr);
+      have_device_memory_key = parse_key_value_u64(buf, "shared_ddr_ipc", &shared_ddr_ipc) || have_device_memory_key;
+      have_device_memory_key = parse_key_value_u64(buf, "driver", &driver) || have_device_memory_key;
+      if (have_device_memory_key) {
+        stats->gpu_memory_usage = shared_ddr;
+        stats_saturating_add(&stats->gpu_memory_usage, shared_ddr_ipc);
+        stats_saturating_add(&stats->gpu_memory_usage, driver);
+        stats->have_memory_usage = true;
+      } else if (parse_key_value_u64(buf, "total", &value) || parse_u64_checked(buf, &value)) {
+        stats->gpu_memory_usage = value;
+        stats->have_memory_usage = true;
+      }
+    }
+    if (parse_key_value_u64(buf, "memory_read_bytes", &value)) {
+      stats->memory_read_bytes = value;
+      stats->have_memory_bandwidth = true;
+    }
+    if (parse_key_value_u64(buf, "memory_write_bytes", &value)) {
+      stats->memory_write_bytes = value;
+      stats->have_memory_bandwidth = true;
+    }
+  }
+
+  len = snprintf(bw_path, sizeof(bw_path), "%s/%ld.bw", dir, (long)pid);
+  if (len >= 0 && (size_t)len < sizeof(bw_path) && read_file_to_buffer(bw_path, buf, sizeof(buf))) {
+    have_any = true;
+    if (parse_key_value_u64(buf, "memory_read_bytes", &value)) {
+      stats->memory_read_bytes = value;
+      stats->have_memory_bandwidth = true;
+    }
+    if (parse_key_value_u64(buf, "memory_write_bytes", &value)) {
+      stats->memory_write_bytes = value;
+      stats->have_memory_bandwidth = true;
+    }
+  }
+
+  return have_any;
+}
+
+static bool sum_pid_alloc_stats(const pid_t *pids, size_t count, uint64_t *memory_usage,
+                                uint64_t *memory_read_bytes, uint64_t *memory_write_bytes,
+                                bool *memory_usage_valid, bool *memory_bandwidth_valid) {
+  bool have_any = false;
+
+  if (memory_usage) {
+    *memory_usage = 0;
+  }
+  if (memory_read_bytes) {
+    *memory_read_bytes = 0;
+  }
+  if (memory_write_bytes) {
+    *memory_write_bytes = 0;
+  }
+  if (memory_usage_valid) {
+    *memory_usage_valid = false;
+  }
+  if (memory_bandwidth_valid) {
+    *memory_bandwidth_valid = false;
+  }
+  if (!pids) {
+    return false;
+  }
+
+  for (size_t i = 0; i < count; i++) {
+    struct pacc_monitor_pid_stats stats;
+    if (!read_pid_alloc_stats(pids[i], &stats)) {
+      continue;
+    }
+    if (stats.have_memory_usage && memory_usage) {
+      stats_saturating_add(memory_usage, stats.gpu_memory_usage);
+      if (memory_usage_valid) {
+        *memory_usage_valid = true;
+      }
+      have_any = true;
+    }
+    if (stats.have_memory_bandwidth) {
+      if (memory_read_bytes) {
+        stats_saturating_add(memory_read_bytes, stats.memory_read_bytes);
+      }
+      if (memory_write_bytes) {
+        stats_saturating_add(memory_write_bytes, stats.memory_write_bytes);
+      }
+      if (memory_bandwidth_valid) {
+        *memory_bandwidth_valid = true;
+      }
+      have_any = true;
+    }
+  }
+  return have_any;
+}
+
+static uint32_t pacc_kib_per_second(uint64_t byte_delta, uint64_t elapsed_ns) {
+  long double rate;
+
+  if (byte_delta == 0 || elapsed_ns == 0) {
+    return 0;
+  }
+  rate = ((long double)byte_delta * 1000000000.0L) / ((long double)elapsed_ns * 1024.0L);
+  if (rate >= (long double)UINT32_MAX) {
+    return UINT32_MAX;
+  }
+  return (uint32_t)(rate + 0.5L);
+}
+
+static void update_memory_bandwidth(struct pacc_monitor_device *dev, struct pacc_monitor_sample *sample,
+                                    uint64_t read_bytes, uint64_t write_bytes) {
+  uint64_t elapsed_ns;
+
+  if (!dev || !sample) {
+    return;
+  }
+
+  sample->memory_bandwidth_valid = true;
+  sample->memory_read_bytes = read_bytes;
+  sample->memory_write_bytes = write_bytes;
+  if (dev->have_memory_bandwidth_last && sample->timestamp_ns > dev->last_memory_bandwidth_ns &&
+      read_bytes >= dev->last_memory_read_bytes && write_bytes >= dev->last_memory_write_bytes) {
+    elapsed_ns = sample->timestamp_ns - dev->last_memory_bandwidth_ns;
+    sample->memory_read_kb_s = pacc_kib_per_second(read_bytes - dev->last_memory_read_bytes, elapsed_ns);
+    sample->memory_write_kb_s = pacc_kib_per_second(write_bytes - dev->last_memory_write_bytes, elapsed_ns);
+  } else {
+    sample->memory_read_kb_s = 0;
+    sample->memory_write_kb_s = 0;
+  }
+  dev->have_memory_bandwidth_last = true;
+  dev->last_memory_bandwidth_ns = sample->timestamp_ns;
+  dev->last_memory_read_bytes = read_bytes;
+  dev->last_memory_write_bytes = write_bytes;
+}
+
+static void set_sample_memory_usage(struct pacc_monitor_sample *sample, uint64_t used_memory) {
+  uint64_t total_memory;
+  uint64_t util;
+
+  if (!sample) {
+    return;
+  }
+
+  total_memory = sample->total_memory;
+  if (total_memory > 0 && used_memory > total_memory) {
+    used_memory = total_memory;
+  }
+  sample->used_memory = used_memory;
+  sample->free_memory = total_memory > used_memory ? total_memory - used_memory : 0;
+  if (total_memory == 0) {
+    sample->mem_util_percent = 0;
+    return;
+  }
+  util = (used_memory * UINT64_C(100) + total_memory / 2) / total_memory;
+  sample->mem_util_percent = util > 100 ? 100 : (uint32_t)util;
 }
 
 static bool read_shared_ddr_info_from_env_or_debugfs(struct pacc_zluda_ddr_info *info) {
@@ -1019,6 +1267,14 @@ static uint64_t read_diag_count(struct pacc_monitor_device *dev) {
 int pacc_monitor_sample_device(struct pacc_monitor_backend *backend, unsigned index,
                                struct pacc_monitor_sample *sample) {
   struct pacc_monitor_device *dev;
+  pid_t memory_pids[PACC_MONITOR_MAX_PIDS];
+  size_t memory_pid_count = 0;
+  bool have_memory_stats = false;
+  bool have_memory_usage_stats = false;
+  bool have_memory_bandwidth_stats = false;
+  uint64_t memory_used = 0;
+  uint64_t memory_read_bytes = 0;
+  uint64_t memory_write_bytes = 0;
   bool activity = false;
   uint64_t active_ns = 0;
   uint64_t elapsed_ns = 0;
@@ -1029,6 +1285,16 @@ int pacc_monitor_sample_device(struct pacc_monitor_backend *backend, unsigned in
 
   dev = &backend->devices[index];
   read_device_snapshot(dev, sample, true);
+  if (scan_processes_for_device(backend, dev, memory_pids,
+                                sizeof(memory_pids) / sizeof(memory_pids[0]),
+                                &memory_pid_count) == 0) {
+    have_memory_stats = sum_pid_alloc_stats(memory_pids, memory_pid_count, &memory_used,
+                                            &memory_read_bytes, &memory_write_bytes,
+                                            &have_memory_usage_stats, &have_memory_bandwidth_stats);
+    if (have_memory_usage_stats) {
+      set_sample_memory_usage(sample, memory_used);
+    }
+  }
 
   activity = sample->active ||
              (dev->have_last && (sample->submitted_seq != dev->last_submitted_seq ||
@@ -1040,6 +1306,9 @@ int pacc_monitor_sample_device(struct pacc_monitor_backend *backend, unsigned in
     pthread_mutex_lock(&backend->lock);
   }
   update_job_counters(dev, sample, activity);
+  if (have_memory_stats && have_memory_bandwidth_stats) {
+    update_memory_bandwidth(dev, sample, memory_read_bytes, memory_write_bytes);
+  }
   if (backend->sampler_running) {
     active_ns = dev->sample_window_active_ns;
     elapsed_ns = dev->sample_window_elapsed_ns;
@@ -1258,9 +1527,11 @@ int pacc_monitor_sample_processes(struct pacc_monitor_backend *backend, unsigned
                                   size_t *count) {
   struct pacc_monitor_device *dev;
   pid_t current_pids[PACC_MONITOR_MAX_PIDS];
+  struct pacc_monitor_pid_stats current_stats[PACC_MONITOR_MAX_PIDS];
   size_t current_count = 0;
   size_t out_count = 0;
   uint64_t window_ns = 0;
+  uint64_t now_ns = monotonic_ns();
 
   if (!backend || index >= backend->count || !processes || !count) {
     return -EINVAL;
@@ -1272,11 +1543,21 @@ int pacc_monitor_sample_processes(struct pacc_monitor_backend *backend, unsigned
   }
 
   dev = &backend->devices[index];
+  memset(current_stats, 0, sizeof(current_stats));
   (void)scan_processes_for_device(backend, dev, current_pids, sizeof(current_pids) / sizeof(current_pids[0]),
                                   &current_count);
+  for (size_t i = 0; i < current_count; i++) {
+    (void)read_pid_alloc_stats(current_pids[i], &current_stats[i]);
+  }
 
   if (backend->lock_initialized) {
     pthread_mutex_lock(&backend->lock);
+  }
+
+  for (size_t i = 0; i < current_count; i++) {
+    struct pacc_monitor_process_accum *entry = get_process_accum(dev, current_pids[i], now_ns);
+    entry->gpu_memory_usage = current_stats[i].have_memory_usage ? current_stats[i].gpu_memory_usage : 0;
+    entry->last_seen_ns = now_ns;
   }
 
   window_ns = dev->process_window_elapsed_ns;
@@ -1307,6 +1588,7 @@ int pacc_monitor_sample_processes(struct pacc_monitor_backend *backend, unsigned
     memset(&processes[out_count], 0, sizeof(processes[out_count]));
     processes[out_count].pid = current_pids[i];
     processes[out_count].sample_window_ns = window_ns;
+    processes[out_count].gpu_memory_usage = current_stats[i].have_memory_usage ? current_stats[i].gpu_memory_usage : 0;
     out_count++;
   }
 
