@@ -131,14 +131,22 @@ struct pacc_monitor_process_accum {
   uint64_t active_ns;
   uint64_t last_seen_ns;
   uint64_t gpu_memory_usage;
+  bool have_runtime_active_last;
+  uint64_t last_runtime_active_ns;
+  uint64_t runtime_last_sample_ns;
+  uint64_t runtime_window_active_ns;
+  uint64_t runtime_window_elapsed_ns;
 };
 
 struct pacc_monitor_pid_stats {
   bool have_memory_usage;
   bool have_memory_bandwidth;
+  bool have_runtime_active;
   uint64_t gpu_memory_usage;
   uint64_t memory_read_bytes;
   uint64_t memory_write_bytes;
+  uint64_t runtime_active_ns;
+  uint64_t runtime_sample_seq;
 };
 
 struct pacc_monitor_device {
@@ -176,6 +184,9 @@ struct pacc_monitor_device {
   uint64_t last_memory_bandwidth_ns;
   uint64_t last_memory_read_bytes;
   uint64_t last_memory_write_bytes;
+  bool have_runtime_active_last;
+  uint64_t last_runtime_active_ns;
+  uint64_t last_runtime_active_sample_ns;
   size_t process_count;
   struct pacc_monitor_process_accum processes[PACC_MONITOR_MAX_TRACKED_PROCESSES];
 };
@@ -306,6 +317,16 @@ static bool parse_key_value_u64(const char *buf, const char *key, uint64_t *out)
   return false;
 }
 
+static bool parse_pacc_key_value_u64(const char *buf, uint32_t pacc_id, const char *suffix, uint64_t *out) {
+  char key[64];
+
+  if (!suffix) {
+    return false;
+  }
+  snprintf(key, sizeof(key), "pacc%u_%s", pacc_id, suffix);
+  return parse_key_value_u64(buf, key, out);
+}
+
 static void stats_saturating_add(uint64_t *total, uint64_t value) {
   if (!total) {
     return;
@@ -317,9 +338,10 @@ static void stats_saturating_add(uint64_t *total, uint64_t value) {
   *total += value;
 }
 
-static bool read_pid_alloc_stats(pid_t pid, struct pacc_monitor_pid_stats *stats) {
+static bool read_pid_alloc_stats(pid_t pid, uint32_t pacc_id, struct pacc_monitor_pid_stats *stats) {
   char path[PATH_MAX];
   char bw_path[PATH_MAX];
+  char sample_path[PATH_MAX];
   char buf[1024];
   const char *dir;
   int len;
@@ -386,12 +408,27 @@ static bool read_pid_alloc_stats(pid_t pid, struct pacc_monitor_pid_stats *stats
     }
   }
 
+  len = snprintf(sample_path, sizeof(sample_path), "%s/%ld.sample", dir, (long)pid);
+  if (len >= 0 && (size_t)len < sizeof(sample_path) &&
+      read_file_to_buffer(sample_path, buf, sizeof(buf))) {
+    have_any = true;
+    if (parse_pacc_key_value_u64(buf, pacc_id, "active_snapshot_ns", &value) ||
+        parse_pacc_key_value_u64(buf, pacc_id, "active_ns", &value)) {
+      stats->runtime_active_ns = value;
+      stats->have_runtime_active = true;
+    }
+    if (parse_pacc_key_value_u64(buf, pacc_id, "sample_seq", &value)) {
+      stats->runtime_sample_seq = value;
+    }
+  }
+
   return have_any;
 }
 
-static bool sum_pid_alloc_stats(const pid_t *pids, size_t count, uint64_t *memory_usage,
+static bool sum_pid_alloc_stats(const pid_t *pids, size_t count, uint32_t pacc_id, uint64_t *memory_usage,
                                 uint64_t *memory_read_bytes, uint64_t *memory_write_bytes,
-                                bool *memory_usage_valid, bool *memory_bandwidth_valid) {
+                                uint64_t *runtime_active_ns, bool *memory_usage_valid,
+                                bool *memory_bandwidth_valid, bool *runtime_active_valid) {
   bool have_any = false;
 
   if (memory_usage) {
@@ -403,11 +440,17 @@ static bool sum_pid_alloc_stats(const pid_t *pids, size_t count, uint64_t *memor
   if (memory_write_bytes) {
     *memory_write_bytes = 0;
   }
+  if (runtime_active_ns) {
+    *runtime_active_ns = 0;
+  }
   if (memory_usage_valid) {
     *memory_usage_valid = false;
   }
   if (memory_bandwidth_valid) {
     *memory_bandwidth_valid = false;
+  }
+  if (runtime_active_valid) {
+    *runtime_active_valid = false;
   }
   if (!pids) {
     return false;
@@ -415,7 +458,7 @@ static bool sum_pid_alloc_stats(const pid_t *pids, size_t count, uint64_t *memor
 
   for (size_t i = 0; i < count; i++) {
     struct pacc_monitor_pid_stats stats;
-    if (!read_pid_alloc_stats(pids[i], &stats)) {
+    if (!read_pid_alloc_stats(pids[i], pacc_id, &stats)) {
       continue;
     }
     if (stats.have_memory_usage && memory_usage) {
@@ -437,8 +480,27 @@ static bool sum_pid_alloc_stats(const pid_t *pids, size_t count, uint64_t *memor
       }
       have_any = true;
     }
+    if (stats.have_runtime_active) {
+      if (runtime_active_ns) {
+        stats_saturating_add(runtime_active_ns, stats.runtime_active_ns);
+      }
+      if (runtime_active_valid) {
+        *runtime_active_valid = true;
+      }
+      have_any = true;
+    }
   }
   return have_any;
+}
+
+static uint32_t pacc_percent_util(uint64_t active_ns, uint64_t elapsed_ns) {
+  uint64_t util;
+
+  if (active_ns == 0 || elapsed_ns == 0) {
+    return 0;
+  }
+  util = (active_ns * UINT64_C(100) + elapsed_ns / 2) / elapsed_ns;
+  return util > 100 ? 100 : (uint32_t)util;
 }
 
 static uint32_t pacc_kib_per_second(uint64_t byte_delta, uint64_t elapsed_ns) {
@@ -452,6 +514,28 @@ static uint32_t pacc_kib_per_second(uint64_t byte_delta, uint64_t elapsed_ns) {
     return UINT32_MAX;
   }
   return (uint32_t)(rate + 0.5L);
+}
+
+static bool update_runtime_util(struct pacc_monitor_device *dev, struct pacc_monitor_sample *sample,
+                                uint64_t runtime_active_ns, uint32_t *util_out) {
+  uint64_t elapsed_ns;
+
+  if (!dev || !sample || !util_out) {
+    return false;
+  }
+  *util_out = 0;
+  if (dev->have_runtime_active_last && sample->timestamp_ns > dev->last_runtime_active_sample_ns &&
+      runtime_active_ns >= dev->last_runtime_active_ns) {
+    elapsed_ns = sample->timestamp_ns - dev->last_runtime_active_sample_ns;
+    *util_out = pacc_percent_util(runtime_active_ns - dev->last_runtime_active_ns, elapsed_ns);
+    dev->last_runtime_active_ns = runtime_active_ns;
+    dev->last_runtime_active_sample_ns = sample->timestamp_ns;
+    return true;
+  }
+  dev->have_runtime_active_last = true;
+  dev->last_runtime_active_ns = runtime_active_ns;
+  dev->last_runtime_active_sample_ns = sample->timestamp_ns;
+  return false;
 }
 
 static void update_memory_bandwidth(struct pacc_monitor_device *dev, struct pacc_monitor_sample *sample,
@@ -1272,12 +1356,17 @@ int pacc_monitor_sample_device(struct pacc_monitor_backend *backend, unsigned in
   bool have_memory_stats = false;
   bool have_memory_usage_stats = false;
   bool have_memory_bandwidth_stats = false;
+  bool have_runtime_active_stats = false;
+  bool have_runtime_util = false;
   uint64_t memory_used = 0;
   uint64_t memory_read_bytes = 0;
   uint64_t memory_write_bytes = 0;
+  uint64_t runtime_active_ns = 0;
+  uint32_t runtime_util = 0;
   bool activity = false;
   uint64_t active_ns = 0;
   uint64_t elapsed_ns = 0;
+  uint32_t sampler_util = 0;
 
   if (!backend || !sample || index >= backend->count) {
     return -EINVAL;
@@ -1288,9 +1377,10 @@ int pacc_monitor_sample_device(struct pacc_monitor_backend *backend, unsigned in
   if (scan_processes_for_device(backend, dev, memory_pids,
                                 sizeof(memory_pids) / sizeof(memory_pids[0]),
                                 &memory_pid_count) == 0) {
-    have_memory_stats = sum_pid_alloc_stats(memory_pids, memory_pid_count, &memory_used,
+    have_memory_stats = sum_pid_alloc_stats(memory_pids, memory_pid_count, dev->pacc_id, &memory_used,
                                             &memory_read_bytes, &memory_write_bytes,
-                                            &have_memory_usage_stats, &have_memory_bandwidth_stats);
+                                            &runtime_active_ns, &have_memory_usage_stats,
+                                            &have_memory_bandwidth_stats, &have_runtime_active_stats);
     if (have_memory_usage_stats) {
       set_sample_memory_usage(sample, memory_used);
     }
@@ -1309,6 +1399,9 @@ int pacc_monitor_sample_device(struct pacc_monitor_backend *backend, unsigned in
   if (have_memory_stats && have_memory_bandwidth_stats) {
     update_memory_bandwidth(dev, sample, memory_read_bytes, memory_write_bytes);
   }
+  if (have_memory_stats && have_runtime_active_stats) {
+    have_runtime_util = update_runtime_util(dev, sample, runtime_active_ns, &runtime_util);
+  }
   if (backend->sampler_running) {
     active_ns = dev->sample_window_active_ns;
     elapsed_ns = dev->sample_window_elapsed_ns;
@@ -1324,14 +1417,17 @@ int pacc_monitor_sample_device(struct pacc_monitor_backend *backend, unsigned in
   }
 
   if (elapsed_ns > 0) {
-    uint64_t util = (active_ns * UINT64_C(100) + elapsed_ns / 2) / elapsed_ns;
-    sample->gpu_util_percent = util > 100 ? 100 : (uint32_t)util;
+    sampler_util = pacc_percent_util(active_ns, elapsed_ns);
+    sample->gpu_util_percent = sampler_util;
   } else if (activity || sample->active ||
              (dev->last_activity_ns && sample->timestamp_ns >= dev->last_activity_ns &&
               sample->timestamp_ns - dev->last_activity_ns <= (uint64_t)backend->busy_window_ms * UINT64_C(1000000))) {
     sample->gpu_util_percent = backend->sampler_running ? 0 : 100;
   } else {
     sample->gpu_util_percent = 0;
+  }
+  if (have_runtime_util && runtime_util > sample->gpu_util_percent) {
+    sample->gpu_util_percent = runtime_util;
   }
 
   return 0;
@@ -1426,6 +1522,76 @@ static bool fd_target_matches_pacc(const char *target, const struct pacc_monitor
   return !strcmp(target, needle);
 }
 
+static bool proc_pid_exists(pid_t pid) {
+  char path[64];
+
+  if (pid <= 0) {
+    return false;
+  }
+  snprintf(path, sizeof(path), "/proc/%ld", (long)pid);
+  return access(path, F_OK) == 0;
+}
+
+static bool stats_entry_pid(const char *name, pid_t *pid) {
+  char *end = NULL;
+  long value;
+
+  if (!name || !*name || !pid || !isdigit((unsigned char)name[0])) {
+    return false;
+  }
+  errno = 0;
+  value = strtol(name, &end, 10);
+  if (errno || value <= 0 || value > INT_MAX || end == name) {
+    return false;
+  }
+  if (*end && strcmp(end, ".sample") && strcmp(end, ".bw")) {
+    return false;
+  }
+  *pid = (pid_t)value;
+  return true;
+}
+
+static void scan_stats_pids_for_device(const struct pacc_monitor_backend *backend,
+                                       const struct pacc_monitor_device *dev,
+                                       pid_t *pids, size_t max_pids, size_t *found) {
+  const char *dir = getenv("HETGPU_PACC_ALLOC_STATS_DIR");
+  DIR *stats_dir;
+  struct dirent *entry;
+  pid_t self_pid = getpid();
+
+  if (!dev || !pids || !found || *found >= max_pids) {
+    return;
+  }
+  if (!dir || !*dir) {
+    dir = PACC_MONITOR_ALLOC_STATS_DEFAULT_DIR;
+  }
+  stats_dir = opendir(dir);
+  if (!stats_dir) {
+    return;
+  }
+
+  while ((entry = readdir(stats_dir)) != NULL && *found < max_pids) {
+    struct pacc_monitor_pid_stats stats;
+    pid_t pid;
+
+    if (!stats_entry_pid(entry->d_name, &pid) || pid_already_seen(pid, pids, *found) ||
+        !proc_pid_exists(pid)) {
+      continue;
+    }
+    if (backend && backend->client == pacc_monitor_client_nvtop &&
+        (pid == self_pid || pid_comm_equals(pid, "nvtop"))) {
+      continue;
+    }
+    if (!read_pid_alloc_stats(pid, dev->pacc_id, &stats)) {
+      continue;
+    }
+    if (stats.have_memory_usage || stats.have_memory_bandwidth || stats.have_runtime_active) {
+      pids[(*found)++] = pid;
+    }
+  }
+  closedir(stats_dir);
+}
+
 static int scan_processes_for_device(const struct pacc_monitor_backend *backend, const struct pacc_monitor_device *dev,
                                      pid_t *pids, size_t max_pids, size_t *count) {
   DIR *proc_dir;
@@ -1491,6 +1657,7 @@ static int scan_processes_for_device(const struct pacc_monitor_backend *backend,
   }
 
   closedir(proc_dir);
+  scan_stats_pids_for_device(backend, dev, pids, max_pids, &found);
   *count = found;
   return 0;
 }
@@ -1547,7 +1714,7 @@ int pacc_monitor_sample_processes(struct pacc_monitor_backend *backend, unsigned
   (void)scan_processes_for_device(backend, dev, current_pids, sizeof(current_pids) / sizeof(current_pids[0]),
                                   &current_count);
   for (size_t i = 0; i < current_count; i++) {
-    (void)read_pid_alloc_stats(current_pids[i], &current_stats[i]);
+    (void)read_pid_alloc_stats(current_pids[i], dev->pacc_id, &current_stats[i]);
   }
 
   if (backend->lock_initialized) {
@@ -1557,6 +1724,17 @@ int pacc_monitor_sample_processes(struct pacc_monitor_backend *backend, unsigned
   for (size_t i = 0; i < current_count; i++) {
     struct pacc_monitor_process_accum *entry = get_process_accum(dev, current_pids[i], now_ns);
     entry->gpu_memory_usage = current_stats[i].have_memory_usage ? current_stats[i].gpu_memory_usage : 0;
+    if (current_stats[i].have_runtime_active) {
+      if (entry->have_runtime_active_last &&
+          current_stats[i].runtime_active_ns >= entry->last_runtime_active_ns &&
+          now_ns > entry->runtime_last_sample_ns) {
+        entry->runtime_window_active_ns += current_stats[i].runtime_active_ns - entry->last_runtime_active_ns;
+        entry->runtime_window_elapsed_ns += now_ns - entry->runtime_last_sample_ns;
+      }
+      entry->last_runtime_active_ns = current_stats[i].runtime_active_ns;
+      entry->runtime_last_sample_ns = now_ns;
+      entry->have_runtime_active_last = true;
+    }
     entry->last_seen_ns = now_ns;
   }
 
@@ -1572,11 +1750,15 @@ int pacc_monitor_sample_processes(struct pacc_monitor_backend *backend, unsigned
     processes[out_count].gpu_active_ns = entry->active_ns;
     processes[out_count].sample_window_ns = window_ns;
     processes[out_count].gpu_memory_usage = entry->gpu_memory_usage;
-    if (window_ns > 0) {
-      uint64_t util = (entry->active_ns * UINT64_C(100) + window_ns / 2) / window_ns;
-      processes[out_count].gpu_util_percent = util > 100 ? 100 : (uint32_t)util;
-    } else {
-      processes[out_count].gpu_util_percent = 0;
+    processes[out_count].gpu_util_percent = pacc_percent_util(entry->active_ns, window_ns);
+    if (entry->runtime_window_elapsed_ns > 0) {
+      uint32_t runtime_util = pacc_percent_util(entry->runtime_window_active_ns,
+                                               entry->runtime_window_elapsed_ns);
+      if (runtime_util > processes[out_count].gpu_util_percent) {
+        processes[out_count].gpu_util_percent = runtime_util;
+        processes[out_count].gpu_active_ns = entry->runtime_window_active_ns;
+        processes[out_count].sample_window_ns = entry->runtime_window_elapsed_ns;
+      }
     }
     out_count++;
   }
@@ -1594,6 +1776,8 @@ int pacc_monitor_sample_processes(struct pacc_monitor_backend *backend, unsigned
 
   for (size_t i = 0; i < dev->process_count; i++) {
     dev->processes[i].active_ns = 0;
+    dev->processes[i].runtime_window_active_ns = 0;
+    dev->processes[i].runtime_window_elapsed_ns = 0;
   }
   dev->process_window_elapsed_ns = 0;
 
